@@ -1,20 +1,23 @@
 import asyncio
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import Message
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.client.default import DefaultBotProperties
 
-BOT_TOKEN = "7811527010:AAFG987e-Eh5En99veWo2FmZm2vzZHRMYNs"  # замени на токен
+BOT_TOKEN = "7811527010:AAFG987e-Eh5En99veWo2FmZm2vzZHRMYNs"  # замени на свой токен
 
 dp = Dispatcher()
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 
 @dp.message(Command("test"))
 async def send_signal(message: Message):
-    # Здесь позже — реальный fetch с API по контракту
     symbol = "MEN"
     contract = "3neBuVfPsd38xXrEybBkLCCLzFMjaj1ERSmoGWqPbonk"
-    marketcap = "$₂₄₂K"  # placeholder
+    marketcap = "$₂₄₂K"
     liquidity = "$₅₅K"
     holders = "≈ 1 230"
     mentions = "45 за 1 ч"
@@ -28,7 +31,7 @@ async def send_signal(message: Message):
         f"🔒 <b>Liquidity:</b> {liquidity}\n"
         f"👥 <b>Holders:</b> {holders}\n"
         f"💬 <b>Twitter mentions:</b> {mentions}\n"
-        f"⭐ <b>Score:</b> {score}\n\n"
+        f"⭐️ <b>Score:</b> {score}\n\n"
         "🔗 <b>Ссылки:</b>\n"
         f"• <a href='https://dexscreener.com/solana/{contract}'>Dexscreener</a>\n"
         f"• <a href='https://matcha.xyz/tokens/solana/{contract}'>Matcha</a>\n"
