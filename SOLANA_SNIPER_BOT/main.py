@@ -7,7 +7,8 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from config import TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID
+from datetime import datetime, timezone, timedelta
+from config import TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID, MIN_SCORE
 
 
 # ----------------------------------------------------------------------------
@@ -77,6 +78,96 @@ def first_present(mapping: Dict[str, Any], *keys: str) -> Optional[Any]:
 		if k in mapping and mapping[k] is not None:
 			return mapping[k]
 	return None
+
+
+def contains_suspicious(text: Optional[str]) -> bool:
+	if not text:
+		return False
+	lowered = str(text).lower()
+	for bad in ("rug", "scam", "test", "fake"):
+		if bad in lowered:
+			return True
+	return False
+
+
+def _parse_created_at(value: Any) -> Optional[datetime]:
+	try:
+		if value is None:
+			return None
+		if isinstance(value, (int, float)):
+			return datetime.fromtimestamp(float(value), tz=timezone.utc)
+		if isinstance(value, str):
+			text = value.replace("Z", "+00:00")
+			return datetime.fromisoformat(text)
+	except Exception:
+		return None
+	return None
+
+
+def _extract_metrics(attrs: Dict[str, Any]) -> Dict[str, Optional[float]]:
+	liquidity = first_present(attrs, "liquidity_usd", "reserve_in_usd", "reserve_usd", "liquidity")
+	vol = None
+	vol_usd_obj = attrs.get("volume_usd")
+	if isinstance(vol_usd_obj, dict):
+		vol = first_present(vol_usd_obj, "h24", "h_24", "24h")
+	elif isinstance(attrs.get("volume_usd_24h"), (int, float)):
+		vol = attrs.get("volume_usd_24h")
+	mcap = first_present(attrs, "market_cap_usd", "market_cap", "fdv_usd", "fdv")
+	price = first_present(attrs, "price_usd", "base_token_price_usd")
+	pairs_count = attrs.get("pairs_count") or attrs.get("pools_count") or attrs.get("pool_count")
+	created_at = attrs.get("pool_created_at") or attrs.get("created_at")
+	return {
+		"liquidity": float(liquidity) if isinstance(liquidity, (int, float)) else None,
+		"volume_24h": float(vol) if isinstance(vol, (int, float)) else None,
+		"market_cap": float(mcap) if isinstance(mcap, (int, float)) else None,
+		"price_usd": float(price) if isinstance(price, (int, float)) else None,
+		"pairs_count": int(pairs_count) if isinstance(pairs_count, (int, float)) else None,
+		"created_at_ts": _parse_created_at(created_at),
+	}
+
+
+def calculate_score(token_data: Dict[str, Any]) -> int:
+	attrs = token_data.get("attributes") or {}
+	m = _extract_metrics(attrs)
+	score = 0
+	if m["liquidity"] is not None and m["liquidity"] > 10_000:
+		score += 20
+	if m["volume_24h"] is not None and m["volume_24h"] > 5_000:
+		score += 20
+	if m["market_cap"] is not None and m["market_cap"] > 50_000:
+		score += 20
+	if m["price_usd"] is not None and m["price_usd"] > 0.0001:
+		score += 10
+	if isinstance(m["pairs_count"], int) and m["pairs_count"] > 1:
+		score += 10
+	created_at = m["created_at_ts"]
+	if isinstance(created_at, datetime):
+		now = datetime.now(timezone.utc)
+		if (now - created_at) < timedelta(hours=24):
+			score += 20
+	return max(0, min(100, score))
+
+
+def is_token_valid(token_data: Dict[str, Any]) -> bool:
+	base = token_data.get("baseToken") or {}
+	name = base.get("name")
+	symbol = base.get("symbol")
+	if contains_suspicious(name) or contains_suspicious(symbol):
+		return False
+	attrs = token_data.get("attributes") or {}
+	m = _extract_metrics(attrs)
+	# required numeric fields must exist and price > 0
+	required_present = all([
+		m["liquidity"] is not None,
+		m["volume_24h"] is not None,
+		m["market_cap"] is not None,
+		m["price_usd"] is not None,
+	])
+	if not required_present:
+		return False
+	if m["price_usd"] is not None and m["price_usd"] <= 0:
+		return False
+	return True
 
 
 # ----------------------------------------------------------------------------
@@ -163,6 +254,8 @@ def _normalize_gecko_pool(pool: Dict[str, Any], included: List[Dict[str, Any]]) 
 		"volume": {"h24": volume_24h},
 		"liquidity": {"usd": liquidity},
 		"url": dex_url,
+		"geckoUrl": gecko_url,
+		"attributes": attrs,
 	}
 
 
@@ -214,7 +307,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 		await update.message.reply_text("Слежение уже выключено.")
 
 
-def build_markdown_message(pair: Dict[str, Any]) -> str:
+def build_markdown_message(pair: Dict[str, Any], score: int) -> str:
 	base = pair.get("baseToken", {}) or {}
 	base_name = base.get("name") or "Unknown"
 	base_symbol = base.get("symbol") or "?"
@@ -229,6 +322,7 @@ def build_markdown_message(pair: Dict[str, Any]) -> str:
 		liq_usd = pair.get("liquidity") if isinstance(pair.get("liquidity"), (int, float)) else None
 
 	url = pair.get("url") or "https://dexscreener.com/solana"
+	gecko_url = pair.get("geckoUrl") or "https://www.geckoterminal.com/solana"
 
 	mc_text = abbreviate_usd(market_cap if market_cap is not None else fdv)
 	fdv_text = abbreviate_usd(fdv)
@@ -236,6 +330,7 @@ def build_markdown_message(pair: Dict[str, Any]) -> str:
 	liq_text = abbreviate_usd(liq_usd)
 
 	lines: List[str] = []
+	lines.append(f"🔥 New Token Alert (Score: {score}/100)")
 	lines.append(f"*Новый токен Solana*")
 	lines.append("")
 	lines.append(f"Название: {base_name} ({base_symbol})")
@@ -243,7 +338,7 @@ def build_markdown_message(pair: Dict[str, Any]) -> str:
 	lines.append(f"Маркеткап: {mc_text}")
 	lines.append(f"Объём 24ч: {vol_text}")
 	lines.append(f"Ликвидность: {liq_text}")
-	lines.append(f"[Dexscreener]({url})")
+	lines.append(f"[GeckoTerminal]({gecko_url}) | [Dexscreener]({url})")
 	lines.append(f"CA: `{base_address}`")
 	return "\n".join(lines)
 
@@ -265,11 +360,18 @@ async def scan_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
 		if not base_address or is_excluded_symbol(base_symbol):
 			continue
 
+		# Extended validation and scoring
+		if not is_token_valid(pair):
+			continue
+		score = calculate_score(pair)
+		if score < int(MIN_SCORE):
+			continue
+
 		if base_address in seen_token_addresses:
 			continue
 		seen_token_addresses.add(base_address)
 
-		message = build_markdown_message(pair)
+		message = build_markdown_message(pair, score)
 		new_messages.append(message)
 
 	if not new_messages:
