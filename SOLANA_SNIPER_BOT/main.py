@@ -24,10 +24,9 @@ logger = logging.getLogger("solana_sniper_bot")
 # Settings
 # ----------------------------------------------------------------------------
 CHECK_INTERVAL_SECONDS: int = 60
-# Primary endpoint: pairs for Solana to focus on new listings in this chain.
-DEXSCREENER_PAIRS_SOLANA_URL: str = "https://api.dexscreener.com/latest/dex/pairs/solana"
-# Secondary endpoint (per task requirement). Used as a fallback if needed.
-DEXSCREENER_TOKENS_URL: str = "https://api.dexscreener.com/latest/dex/tokens"
+# GeckoTerminal public API for newly created pools on Solana (no API key required)
+GECKO_BASE_URL: str = "https://api.geckoterminal.com/api/v2"
+GECKO_NEW_POOLS_URL: str = f"{GECKO_BASE_URL}/networks/solana/new_pools"
 
 # Exclude common stable/bluechip symbols and wrapped variants
 EXCLUDED_SYMBOLS: Set[str] = {
@@ -73,15 +72,22 @@ def safe_get_nested(mapping: Dict[str, Any], *keys: str) -> Optional[Any]:
 	return cursor
 
 
+def first_present(mapping: Dict[str, Any], *keys: str) -> Optional[Any]:
+	for k in keys:
+		if k in mapping and mapping[k] is not None:
+			return mapping[k]
+	return None
+
+
 # ----------------------------------------------------------------------------
-# Dexscreener fetching/parsing
+# GeckoTerminal fetching/parsing
 # ----------------------------------------------------------------------------
 
 async def fetch_json(session: aiohttp.ClientSession, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
 	try:
 		async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
 			if resp.status != 200:
-				logger.warning("Dexscreener returned non-200 status %s for %s", resp.status, url)
+				logger.warning("HTTP %s for %s", resp.status, url)
 				return None
 			return await resp.json()
 	except Exception as exc:
@@ -95,42 +101,87 @@ def is_excluded_symbol(symbol: Optional[str]) -> bool:
 	return symbol.upper() in EXCLUDED_SYMBOLS
 
 
-def extract_pairs_from_tokens_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-	# Some Dexscreener endpoints return a top-level 'pairs'. If it's tokens-based, adapt as needed.
-	pairs = payload.get("pairs")
-	if isinstance(pairs, list):
-		return pairs
-	# Try 'tokens' list -> each may include bestPair or pairs
-	tokens = payload.get("tokens")
-	if isinstance(tokens, list):
-		collected: List[Dict[str, Any]] = []
-		for token in tokens:
-			best_pair = token.get("bestPair")
-			if isinstance(best_pair, dict):
-				collected.append(best_pair)
-			pairs_list = token.get("pairs")
-			if isinstance(pairs_list, list):
-				collected.extend([p for p in pairs_list if isinstance(p, dict)])
-		return collected
-	return []
+def _resolve_token(included: List[Dict[str, Any]], rel: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+	if not isinstance(rel, dict):
+		return None
+	rel_data = rel.get("data")
+	if not isinstance(rel_data, dict):
+		return None
+	rel_id = rel_data.get("id")
+	if not rel_id:
+		return None
+	for item in included or []:
+		if item.get("id") == rel_id:
+			attrs = item.get("attributes", {}) or {}
+			return {
+				"address": attrs.get("address") or attrs.get("id") or item.get("id"),
+				"symbol": attrs.get("symbol"),
+				"name": attrs.get("name"),
+			}
+	return None
+
+
+def _normalize_gecko_pool(pool: Dict[str, Any], included: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+	attrs = pool.get("attributes", {}) or {}
+	rels = pool.get("relationships", {}) or {}
+	base_tok = _resolve_token(included, rels.get("base_token"))
+	quote_tok = _resolve_token(included, rels.get("quote_token"))
+	candidate = None
+	# Prefer non-stable token as the base for alerts
+	if base_tok and not is_excluded_symbol(base_tok.get("symbol")):
+		candidate = base_tok
+	elif quote_tok and not is_excluded_symbol(quote_tok.get("symbol")):
+		candidate = quote_tok
+	else:
+		return None
+
+	fdv = first_present(attrs, "fdv_usd", "fdv", "fully_diluted_valuation_usd")
+	market_cap = first_present(attrs, "market_cap_usd", "market_cap")
+	volume_24h = None
+	vol_usd_obj = attrs.get("volume_usd")
+	if isinstance(vol_usd_obj, dict):
+		volume_24h = first_present(vol_usd_obj, "h24", "h_24", "24h")
+	elif isinstance(attrs.get("volume_usd_24h"), (int, float)):
+		volume_24h = attrs.get("volume_usd_24h")
+
+	liquidity = first_present(attrs, "reserve_in_usd", "liquidity_usd", "reserve_usd")
+
+	pool_address = attrs.get("address") or pool.get("id")
+	gecko_url = f"https://www.geckoterminal.com/solana/pools/{pool_address}" if pool_address else "https://www.geckoterminal.com/solana"
+	# Also provide a Dexscreener token page link via token mint address (works as a generic token view)
+	dex_url = f"https://dexscreener.com/solana/{candidate.get('address')}" if candidate.get("address") else gecko_url
+
+	return {
+		"chainId": "solana",
+		"baseToken": {
+			"name": candidate.get("name") or "Unknown",
+			"symbol": candidate.get("symbol") or "?",
+			"address": candidate.get("address") or "?",
+		},
+		"fdv": fdv,
+		"marketCap": market_cap,
+		"volume": {"h24": volume_24h},
+		"liquidity": {"usd": liquidity},
+		"url": dex_url,
+	}
 
 
 async def get_latest_solana_pairs(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
-	# Prefer Solana pairs endpoint to focus on new listings for this chain.
-	primary = await fetch_json(session, DEXSCREENER_PAIRS_SOLANA_URL)
-	pairs: List[Dict[str, Any]] = []
-	if primary:
-		pairs = primary.get("pairs") or []
-		if isinstance(pairs, list):
-			pairs = [p for p in pairs if isinstance(p, dict) and p.get("chainId") == "solana"]
-			return pairs
-
-	# Fallback to tokens endpoint (per requirement), filter chainId == solana
-	secondary = await fetch_json(session, DEXSCREENER_TOKENS_URL)
-	if secondary:
-		pairs = extract_pairs_from_tokens_payload(secondary)
-		pairs = [p for p in pairs if isinstance(p, dict) and p.get("chainId") == "solana"]
-	return pairs
+	# GeckoTerminal: request recent new pools and map them to a Dexscreener-like structure
+	params = {"include": "base_token,quote_token", "page": 1}
+	payload = await fetch_json(session, GECKO_NEW_POOLS_URL, params=params)
+	if not payload:
+		return []
+	data = payload.get("data") or []
+	included = payload.get("included") or []
+	normalized: List[Dict[str, Any]] = []
+	for pool in data:
+		if not isinstance(pool, dict):
+			continue
+		item = _normalize_gecko_pool(pool, included)
+		if item:
+			normalized.append(item)
+	return normalized
 
 
 # ----------------------------------------------------------------------------
@@ -143,7 +194,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 		"Команды:\n"
 		"/watch — включить слежение\n"
 		"/stop — выключить слежение\n\n"
-		"Я проверяю Dexscreener каждые 60 секунд и присылаю новые токены без дубликатов."
+		"Я проверяю новые пулы на GeckoTerminal каждые 60 секунд и присылаю новые токены без дубликатов."
 	)
 	await update.message.reply_text(text)
 
