@@ -9,6 +9,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from datetime import datetime, timezone, timedelta
 from config import TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID, MIN_SCORE
+from config import BITQUERY_TOKEN, OPENAI_API_KEY
+
+# NEW IMPORTS
+import json
+import websockets
+from openai import OpenAI
 
 
 # ----------------------------------------------------------------------------
@@ -28,6 +34,35 @@ CHECK_INTERVAL_SECONDS: int = 60
 # GeckoTerminal public API for newly created pools on Solana (no API key required)
 GECKO_BASE_URL: str = "https://api.geckoterminal.com/api/v2"
 GECKO_NEW_POOLS_URL: str = f"{GECKO_BASE_URL}/networks/solana/new_pools"
+# Token info endpoint
+GECKO_TOKEN_URL_TPL: str = f"{GECKO_BASE_URL}/networks/solana/tokens/{{mint}}"
+
+# Dexscreener token endpoint
+DEXSCREENER_TOKEN_URL_TPL: str = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
+
+# Bitquery streaming
+BITQUERY_WS_URL: str = "wss://streaming.bitquery.io/graphql"
+# Pump.fun create instruction subscription (new token signal)
+BITQUERY_PUMPFUN_SUB: str = (
+	"subscription {\n"
+	"  Solana {\n"
+	"    TokenSupplyUpdates(\n"
+	"      where: {Instruction: {Program: {Address: {is: \"6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P\"}, Method: {is: \"create\"}}}}\n"
+	"    ) {\n"
+	"      Block { Time }\n"
+	"      Transaction { Signer }\n"
+	"      TokenSupplyUpdate {\n"
+	"        Currency {\n"
+	"          Symbol\n"
+	"          Name\n"
+	"          MintAddress\n"
+	"          Uri\n"
+	"        }\n"
+	"      }\n"
+	"    }\n"
+	"  }\n"
+	"}\n"
+)
 
 # Exclude common stable/bluechip symbols and wrapped variants
 EXCLUDED_SYMBOLS: Set[str] = {
@@ -41,6 +76,10 @@ EXCLUDED_SYMBOLS: Set[str] = {
 # ----------------------------------------------------------------------------
 subscribed_chat_ids: Set[int] = set()
 seen_token_addresses: Set[str] = set()
+
+# New runtime queues/sets
+new_token_events_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+ws_reconnect_backoff_seconds: float = 3.0
 
 
 # ----------------------------------------------------------------------------
@@ -184,6 +223,78 @@ async def fetch_json(session: aiohttp.ClientSession, url: str, params: Optional[
 	except Exception as exc:
 		logger.exception("Failed to fetch %s: %s", url, exc)
 		return None
+
+
+async def http_get_json(session: aiohttp.ClientSession, url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, retries: int = 3, delay: float = 1.0) -> Optional[Dict[str, Any]]:
+	for attempt in range(1, retries + 1):
+		try:
+			async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+				if resp.status != 200:
+					logger.warning("GET %s -> %s", url, resp.status)
+					text = await resp.text()
+					logger.debug("Response text: %s", text[:500])
+					await asyncio.sleep(delay)
+					continue
+				return await resp.json()
+		except Exception as exc:
+			logger.exception("GET failed %s (attempt %d/%d): %s", url, attempt, retries, exc)
+			await asyncio.sleep(delay)
+	return None
+
+
+async def fetch_dexscreener_by_mint(session: aiohttp.ClientSession, mint: str) -> Dict[str, Any]:
+	url = DEXSCREENER_TOKEN_URL_TPL.format(mint=mint)
+	data = await http_get_json(session, url)
+	result: Dict[str, Any] = {"liquidity_usd": None, "volume_24h_usd": None, "market_cap_usd": None, "pairs_count": None, "price_usd": None}
+	if not data:
+		return result
+	pairs = data.get("pairs") or []
+	if not isinstance(pairs, list) or not pairs:
+		return result
+	# Aggregate metrics across pairs
+	liq = 0.0
+	vol = 0.0
+	mc = 0.0
+	price = None
+	for p in pairs:
+		try:
+			l = p.get("liquidity") or {}
+			liq += float(l.get("usd") or 0)
+			v = p.get("volume") or {}
+			vol += float(v.get("h24") or 0)
+			mc = max(mc, float(p.get("fdv") or p.get("marketCap") or 0))
+			if price is None and p.get("priceUsd") is not None:
+				price = float(p.get("priceUsd"))
+		except Exception:
+			continue
+	result["liquidity_usd"] = liq if liq > 0 else None
+	result["volume_24h_usd"] = vol if vol > 0 else None
+	result["market_cap_usd"] = mc if mc > 0 else None
+	result["pairs_count"] = len(pairs)
+	result["price_usd"] = price
+	return result
+
+
+async def fetch_gecko_token(session: aiohttp.ClientSession, mint: str) -> Dict[str, Any]:
+	url = GECKO_TOKEN_URL_TPL.format(mint=mint)
+	params = {"include": "pools"}
+	data = await http_get_json(session, url, params=params)
+	result: Dict[str, Any] = {"pool_created_at": None, "holders": None, "liquidity_usd": None, "volume_24h_usd": None, "price_usd": None}
+	if not data:
+		return result
+	data_list = data.get("data")
+	if isinstance(data_list, list) and data_list:
+		attrs = data_list[0].get("attributes", {}) or {}
+		# Try top-level attributes first
+		result["price_usd"] = attrs.get("price_usd") or attrs.get("base_token_price_usd")
+		vol = attrs.get("volume_usd") or {}
+		if isinstance(vol, dict):
+			result["volume_24h_usd"] = vol.get("h24") or vol.get("24h")
+		liq = attrs.get("liquidity_usd") or attrs.get("reserve_in_usd")
+		result["liquidity_usd"] = liq
+		result["holders"] = attrs.get("holders") or attrs.get("holders_count")
+		result["pool_created_at"] = attrs.get("pool_created_at") or attrs.get("created_at")
+	return result
 
 
 def is_excluded_symbol(symbol: Optional[str]) -> bool:
@@ -402,11 +513,238 @@ async def prefill_seen_tokens() -> None:
 
 
 async def on_startup(app: Application) -> None:
-	# Auto-subscribe ADMIN_CHAT_ID if provided (>0) so that bot starts reporting immediately after launch
+	# Auto-subscribe ADMIN_CHAT_ID if provided (>0)
 	if isinstance(ADMIN_CHAT_ID, int) and ADMIN_CHAT_ID > 0:
 		subscribed_chat_ids.add(ADMIN_CHAT_ID)
 	await prefill_seen_tokens()
 	logger.info("Subscribed chat IDs at startup: %s", subscribed_chat_ids)
+	# Launch background consumers
+	asyncio.create_task(bitquery_ws_consumer())
+	# Create a simple context proxy for worker
+	class _Ctx:
+		def __init__(self, bot):
+			self.bot = bot
+	context_proxy = _Ctx(app.bot)
+	asyncio.create_task(process_new_tokens_worker(context_proxy))
+
+
+async def bitquery_ws_consumer() -> None:
+	global ws_reconnect_backoff_seconds
+	headers = {
+		"Authorization": f"Bearer {BITQUERY_TOKEN}",
+		"Content-Type": "application/json",
+	}
+	payload = json.dumps({"type": "connection_init", "payload": {}})
+
+	while True:
+		try:
+			logger.info("Connecting to Bitquery WS...")
+			async with websockets.connect(BITQUERY_WS_URL, extra_headers=headers, ping_interval=20, ping_timeout=20) as ws:
+				# init connection (Apollo protocol)
+				await ws.send(payload)
+				# start subscription
+				sub_msg = json.dumps({
+					"id": "pumpfun_create",
+					"type": "start",
+					"payload": {"query": BITQUERY_PUMPFUN_SUB},
+				})
+				await ws.send(sub_msg)
+				logger.info("Bitquery WS subscribed to Pump.fun create")
+
+				async for raw in ws:
+					try:
+						msg = json.loads(raw)
+						if msg.get("type") not in ("data",):
+							continue
+						payload_data = (((msg.get("payload") or {}).get("data") or {}).get("Solana") or {})
+						updates = payload_data.get("TokenSupplyUpdates") or []
+						for upd in updates:
+							currency = (((upd.get("TokenSupplyUpdate") or {}).get("Currency")) or {})
+							mint = currency.get("MintAddress")
+							symbol = currency.get("Symbol")
+							name = currency.get("Name")
+							if not mint:
+								continue
+							if is_excluded_symbol(symbol):
+								continue
+							if mint in seen_token_addresses:
+								continue
+							evt = {"mint": mint, "symbol": symbol, "name": name}
+							await new_token_events_queue.put(evt)
+							logger.info("Enqueued new token from Bitquery: %s %s", symbol, mint)
+					except Exception:
+						logger.exception("Failed to parse Bitquery message")
+			ws_reconnect_backoff_seconds = 3.0
+		except Exception:
+			logger.exception("Bitquery WS disconnected; retrying in %.1fs", ws_reconnect_backoff_seconds)
+			await asyncio.sleep(ws_reconnect_backoff_seconds)
+			ws_reconnect_backoff_seconds = min(ws_reconnect_backoff_seconds * 2, 60.0)
+
+
+# AI START
+_openai_client: Optional[OpenAI] = None
+
+def get_openai_client() -> OpenAI:
+	global _openai_client
+	if _openai_client is None:
+		_openai_client = OpenAI(api_key=OPENAI_API_KEY)
+	return _openai_client
+
+
+async def ai_short_analysis(score: int, metrics: Dict[str, Any]) -> str:
+	try:
+		client = get_openai_client()
+		prompt = (
+			"Сформулируй короткое (1–2 предложения, до 150 символов) заключение по токену на основе метрик и score. "
+			"Не используй технические детали. Используй эмодзи 🟢🟡🔴 по уместности.\n"
+			f"Score: {score}. Метрики: {json.dumps(metrics, ensure_ascii=False)[:800]}"
+		)
+		# Use the Chat Completions API of the new OpenAI SDK
+		resp = await asyncio.get_event_loop().run_in_executor(
+			None,
+			lambda: client.chat.completions.create(
+				model="gpt-4o-mini",
+				messages=[{"role": "user", "content": prompt}],
+				max_tokens=60,
+				temperature=0.3,
+			),
+		)
+		text = (resp.choices[0].message.content or "").strip()
+		if len(text) > 150:
+			text = text[:147] + "..."
+		return text
+	except Exception:
+		logger.exception("OpenAI analysis failed")
+		# Fallback by score
+		if score >= 80:
+			return "🟢 Перспективный токен: отличная ликвидность и активные торги."
+		if score >= 60:
+			return "🟡 Средний потенциал, стоит следить за объёмом."
+		return "🔴 Высокий риск: слабые метрики."
+# AI END
+
+
+# SCORE START
+
+def compute_score_from_metrics(metrics: Dict[str, Any]) -> int:
+	score = 0
+	liq = metrics.get("liquidity_usd")
+	vol = metrics.get("volume_24h_usd")
+	mcap = metrics.get("market_cap_usd")
+	price = metrics.get("price_usd")
+	pairs = metrics.get("pairs_count")
+	created_at = metrics.get("pool_created_at_dt")
+	if isinstance(liq, (int, float)) and liq > 10_000:
+		score += 20
+	if isinstance(vol, (int, float)) and vol > 5_000:
+		score += 20
+	if isinstance(mcap, (int, float)) and mcap > 50_000:
+		score += 20
+	if isinstance(price, (int, float)) and price > 0.0001:
+		score += 10
+	if isinstance(pairs, int) and pairs > 1:
+		score += 10
+	if isinstance(created_at, datetime):
+		now = datetime.now(timezone.utc)
+		if (now - created_at) < timedelta(hours=24):
+			score += 20
+	return max(0, min(100, score))
+# SCORE END
+
+
+async def process_new_tokens_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
+	async with aiohttp.ClientSession() as session:
+		while True:
+			evt = await new_token_events_queue.get()
+			mint = evt.get("mint")
+			symbol = evt.get("symbol")
+			name = evt.get("name")
+			if not mint:
+				continue
+			try:
+				logger.info("Processing mint %s (%s) from queue", mint, symbol)
+				# Fetch metrics from Dexscreener and Gecko
+				ds = await fetch_dexscreener_by_mint(session, mint)
+				gt = await fetch_gecko_token(session, mint)
+
+				# Merge metrics
+				metrics: Dict[str, Any] = {
+					"symbol": symbol,
+					"name": name,
+					"mint": mint,
+					"liquidity_usd": None,
+					"volume_24h_usd": None,
+					"market_cap_usd": None,
+					"pairs_count": None,
+					"price_usd": None,
+					"pool_created_at": gt.get("pool_created_at"),
+					"holders": gt.get("holders"),
+					"gecko_url": f"https://www.geckoterminal.com/solana/tokens/{mint}",
+					"dexs_url": f"https://dexscreener.com/solana/{mint}",
+				}
+				# Prefer Dexscreener for liquidity/volume/marketcap/pairs/price
+				metrics["liquidity_usd"] = ds.get("liquidity_usd") if ds.get("liquidity_usd") is not None else gt.get("liquidity_usd")
+				metrics["volume_24h_usd"] = ds.get("volume_24h_usd") if ds.get("volume_24h_usd") is not None else gt.get("volume_24h_usd")
+				metrics["market_cap_usd"] = ds.get("market_cap_usd")
+				metrics["pairs_count"] = ds.get("pairs_count")
+				metrics["price_usd"] = ds.get("price_usd") if ds.get("price_usd") is not None else gt.get("price_usd")
+
+				# Parse created_at
+				created_at_dt = _parse_created_at(metrics.get("pool_created_at"))
+				metrics["pool_created_at_dt"] = created_at_dt
+
+				# Filtering rules
+				if metrics["liquidity_usd"] is None or metrics["volume_24h_usd"] is None or metrics["price_usd"] is None:
+					logger.info("Filtered out due to missing core metrics: %s", mint)
+					continue
+				if isinstance(metrics["price_usd"], (int, float)) and metrics["price_usd"] <= 0:
+					logger.info("Filtered out due to zero price: %s", mint)
+					continue
+				if contains_suspicious(symbol) or contains_suspicious(name):
+					logger.info("Filtered out due to suspicious name/symbol: %s %s", name, symbol)
+					continue
+
+				# Compute score
+				score = compute_score_from_metrics(metrics)
+				logger.info("Score for %s: %d", mint, score)
+				if score < int(MIN_SCORE):
+					logger.info("Filtered out due to low score (<%s): %s", MIN_SCORE, mint)
+					continue
+
+				# AI analysis
+				ai_text = await ai_short_analysis(score, metrics)
+
+				# Build and send message
+				price_text = abbreviate_usd(metrics["price_usd"]) if metrics["price_usd"] is not None else "N/A"
+				liq_text = abbreviate_usd(metrics["liquidity_usd"]) if metrics["liquidity_usd"] is not None else "N/A"
+				vol_text = abbreviate_usd(metrics["volume_24h_usd"]) if metrics["volume_24h_usd"] is not None else "N/A"
+				mc_text = abbreviate_usd(metrics["market_cap_usd"]) if metrics["market_cap_usd"] is not None else "N/A"
+
+				lines: List[str] = []
+				lines.append(f"🔥 New Token Alert (Score: {score}/100)")
+				lines.append(f"{name or 'Unknown'} ({symbol or '?'})")
+				lines.append(f"Цена: {price_text}")
+				lines.append(f"Маркеткап: {mc_text}")
+				lines.append(f"Ликвидность: {liq_text}")
+				lines.append(f"Объём 24ч: {vol_text}")
+				lines.append(f"AI Analysis: {ai_text}")
+				lines.append(f"[Dexscreener]({metrics['dexs_url']})")
+				lines.append(f"[Geckoterminal]({metrics['gecko_url']})")
+				lines.append(f"Contract: `{mint}`")
+				msg = "\n".join(lines)
+
+				# Send to subscribers
+				for chat_id in list(subscribed_chat_ids):
+					try:
+						await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=False)
+						logger.info("Message sent to %s for %s", chat_id, mint)
+					except Exception:
+						logger.exception("Failed sending message to %s", chat_id)
+
+				# Mark as seen to avoid duplicates
+				seen_token_addresses.add(mint)
+			except Exception:
+				logger.exception("Failed to process event for %s", mint)
 
 
 def main() -> None:
@@ -416,9 +754,6 @@ def main() -> None:
 	application.add_handler(CommandHandler("start", start))
 	application.add_handler(CommandHandler("watch", watch))
 	application.add_handler(CommandHandler("stop", stop))
-
-	# Periodic job every 60s
-	application.job_queue.run_repeating(scan_and_notify, interval=CHECK_INTERVAL_SECONDS, first=3)
 
 	# Startup hook
 	application.post_init = on_startup
