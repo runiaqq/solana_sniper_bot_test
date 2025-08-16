@@ -16,6 +16,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from datetime import datetime, timezone, timedelta
 from config import TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID, MIN_SCORE, HELIUS_API_KEY, OPENAI_API_KEY, MODE, DYNAMIC_WINDOW_RECENT
 
+# Optional Bitquery token (may be absent)
+try:
+	from config import BITQUERY_TOKEN  # type: ignore
+except Exception:
+	BITQUERY_TOKEN = ""
+
 # NEW IMPORTS
 import json
 import websockets
@@ -560,8 +566,9 @@ async def on_startup(app: Application) -> None:
 		subscribed_chat_ids.add(ADMIN_CHAT_ID)
 	await prefill_seen_tokens()
 	logger.info("Subscribed chat IDs at startup: %s", subscribed_chat_ids)
-	# Launch background consumers
-	asyncio.create_task(bitquery_ws_consumer())
+	# Launch background consumers (Bitquery optional). If no token, skip.
+	if BITQUERY_TOKEN:
+		asyncio.create_task(bitquery_ws_consumer())
 	# Create a simple context proxy for worker
 	class _Ctx:
 		def __init__(self, bot):
@@ -572,6 +579,8 @@ async def on_startup(app: Application) -> None:
 
 async def bitquery_ws_consumer() -> None:
 	global ws_reconnect_backoff_seconds
+	if not BITQUERY_TOKEN:
+		return
 	headers = {
 		"Authorization": f"Bearer {BITQUERY_TOKEN}",
 		"Content-Type": "application/json",
