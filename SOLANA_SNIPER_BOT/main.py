@@ -79,6 +79,20 @@ EXCLUDED_SYMBOLS: Set[str] = {
 	"SOL", "WSOL", "MSOL", "BSOL", "JITOSOL",
 }
 
+# Simple rate limits / cooldowns for public APIs to avoid 429 storms
+DS_COOLDOWN_UNTIL: float = 0.0
+GECKO_COOLDOWN_UNTIL: float = 0.0
+DS_LAST_CALL: float = 0.0
+DS_MIN_INTERVAL_S: float = 0.9
+
+async def _ds_rate_gate() -> None:
+	global DS_LAST_CALL
+	now = time.monotonic()
+	delta = now - DS_LAST_CALL
+	if delta < DS_MIN_INTERVAL_S:
+		await asyncio.sleep(DS_MIN_INTERVAL_S - delta)
+	DS_LAST_CALL = time.monotonic()
+
 
 # ----------------------------------------------------------------------------
 # In-memory runtime state
@@ -235,10 +249,21 @@ async def fetch_json(session: aiohttp.ClientSession, url: str, params: Optional[
 
 
 async def http_get_json(session: aiohttp.ClientSession, url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, retries: int = 3, delay: float = 1.0) -> Optional[Dict[str, Any]]:
+	global DS_COOLDOWN_UNTIL, GECKO_COOLDOWN_UNTIL
 	for attempt in range(1, retries + 1):
 		try:
 			async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
 				if resp.status != 200:
+					# Silence Gecko 404 (fresh mint)
+					if url.startswith("https://api.geckoterminal.com") and resp.status == 404:
+						return None
+					# Apply cooldowns on 429s
+					if url.startswith("https://api.dexscreener.com") and resp.status == 429:
+						DS_COOLDOWN_UNTIL = time.monotonic() + 120.0
+						return None
+					if url.startswith("https://api.geckoterminal.com") and resp.status == 429:
+						GECKO_COOLDOWN_UNTIL = time.monotonic() + 180.0
+						return None
 					logger.warning("GET %s -> %s", url, resp.status)
 					text = await resp.text()
 					logger.debug("Response text: %s", text[:500])
@@ -252,6 +277,10 @@ async def http_get_json(session: aiohttp.ClientSession, url: str, params: Option
 
 
 async def fetch_dexscreener_by_mint(session: aiohttp.ClientSession, mint: str) -> Dict[str, Any]:
+	# honor cooldown
+	if time.monotonic() < DS_COOLDOWN_UNTIL:
+		return {"liquidity_usd": None, "volume_24h_usd": None, "market_cap_usd": None, "pairs_count": None, "price_usd": None}
+	await _ds_rate_gate()
 	url = DEXSCREENER_TOKEN_URL_TPL.format(mint=mint)
 	data = await http_get_json(session, url)
 	result: Dict[str, Any] = {"liquidity_usd": None, "volume_24h_usd": None, "market_cap_usd": None, "pairs_count": None, "price_usd": None}
@@ -285,6 +314,9 @@ async def fetch_dexscreener_by_mint(session: aiohttp.ClientSession, mint: str) -
 
 
 async def fetch_gecko_token(session: aiohttp.ClientSession, mint: str) -> Dict[str, Any]:
+	# honor cooldown
+	if time.monotonic() < GECKO_COOLDOWN_UNTIL:
+		return {"pool_created_at": None, "holders": None, "liquidity_usd": None, "volume_24h_usd": None, "price_usd": None}
 	url = GECKO_TOKEN_URL_TPL.format(mint=mint)
 	params = {"include": "pools"}
 	data = await http_get_json(session, url, params=params)
@@ -560,6 +592,7 @@ async def bitquery_ws_consumer() -> None:
 				})
 				await ws.send(sub_msg)
 				logger.info("Bitquery WS subscribed to Pump.fun create")
+				# Also launch Helius WS + Enhanced worker for higher throughput if available later
 
 				async for raw in ws:
 					try:
@@ -719,14 +752,19 @@ async def process_new_tokens_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
 				logger.info("Score for %s: %d", mint, score)
 				if score < int(MIN_SCORE):
 					logger.info("Filtered out due to low score (<%s): %s", MIN_SCORE, mint)
+					# still persist history for learning later
+					try:
+						await save_score_history(mint, int(time.time()), score, {"basic": True})
+					except Exception:
+						pass
 					continue
 
 				# Build on-chain feature dict for gates/scoring (placeholders for early metrics)
 				onchain = {
-					"market_cap_usd": agg.get("market_cap_usd"),
-					"liquidity_usd": agg.get("liquidity_usd"),
-					"pairs_count": agg.get("pairs_count") or 0,
-					"price_usd": agg.get("price_usd"),
+					"market_cap_usd": metrics.get("market_cap_usd"),
+					"liquidity_usd": metrics.get("liquidity_usd"),
+					"pairs_count": metrics.get("pairs_count") or 0,
+					"price_usd": metrics.get("price_usd"),
 					# Early micro-signals placeholders (could be filled from Enhanced rolling window later)
 					"buy_ratio_10m": None,
 					"unique_buyers_5m": None,
@@ -798,7 +836,7 @@ async def process_new_tokens_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
 				})
 
 				# Build and send message (enhanced)
-				price_text = abbreviate_usd(metrics["price_usd"]) if (metrics := {"price_usd": metrics.get("price_usd") if 'metrics' in locals() else onchain.get("price_usd")}) else abbreviate_usd(onchain.get("price_usd"))
+				price_text = abbreviate_usd(onchain.get("price_usd"))
 				liq_text = abbreviate_usd(onchain.get("liquidity_usd"))
 				vol_text = abbreviate_usd(onchain.get("volume_24h_usd"))
 				mc_text = abbreviate_usd(onchain.get("market_cap_usd"))

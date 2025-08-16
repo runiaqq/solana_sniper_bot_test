@@ -25,17 +25,28 @@ def gate1_onchain(onc: Dict[str, Any]) -> Tuple[bool, str]:
 	buy_ratio = onc.get("buy_ratio_10m") or onc.get("buy_ratio_5m")
 	uniq = onc.get("unique_buyers_5m") or onc.get("unique_buyers_10m")
 
+	# Allow very-early tokens when there is a live price and at least one pair
+	if isinstance(price, (int, float)) and price > 0 and pairs >= GATE_MIN_PAIRS:
+		return True, "price+pair ok"
+
+	# Basic mc/price sanity
 	if (mc is None or mc < GATE_MIN_MC_USD) and (price is None):
 		return False, "no mc>min and no price"
-	if (liq is not None and liq >= GATE_MIN_LIQ_USD and pairs >= GATE_MIN_PAIRS):
-		pass
-	else:
-		vol5 = onc.get("volume_5m_raw")
-		if not (vol5 and uniq and uniq >= GATE_MIN_UNIQUE_BUYERS_5M):
-			return False, "no volume/uniq gate"
-	if buy_ratio is not None and buy_ratio < GATE_MIN_BUY_RATIO:
-		return False, "buy_ratio too low"
-	return True, "ok"
+
+	# Standard liquidity/pairs gate
+	if (isinstance(liq, (int, float)) and liq >= GATE_MIN_LIQ_USD and pairs >= GATE_MIN_PAIRS):
+		return True, "liq/pairs ok"
+
+	# Micro-activity fallback (if we have it)
+	vol5 = onc.get("volume_5m_raw")
+	if isinstance(uniq, (int, float)) and uniq >= GATE_MIN_UNIQUE_BUYERS_5M and isinstance(vol5, (int, float)) and vol5 > 0:
+		return True, "vol/uniq ok"
+
+	# Fallback: decent mc alone can pass early
+	if isinstance(mc, (int, float)) and mc >= GATE_MIN_MC_USD:
+		return True, "mc ok"
+
+	return False, "no early signal"
 
 
 def gate2_safety(safety: Dict[str, Any]) -> Tuple[bool, str, int]:
