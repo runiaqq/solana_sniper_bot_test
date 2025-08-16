@@ -1,20 +1,29 @@
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Set
+import time
+import json
+import random
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiohttp
+import websockets
+import openai
+from openai import OpenAI
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from datetime import datetime, timezone, timedelta
-from config import TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID, MIN_SCORE
-from config import BITQUERY_TOKEN, OPENAI_API_KEY
+from config import TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID, MIN_SCORE, HELIUS_API_KEY, OPENAI_API_KEY, MODE, DYNAMIC_WINDOW_RECENT
 
 # NEW IMPORTS
 import json
 import websockets
 from openai import OpenAI
+
+from store_db import init_db, save_features, save_token_row, save_score_history, get_recent_scores
+from scoring_early import gate1_onchain, score_multifactor, contains_bad
+from twitter_client import fetch_project_context, fetch_account_stats, search_mentions
 
 
 # ----------------------------------------------------------------------------
@@ -513,6 +522,7 @@ async def prefill_seen_tokens() -> None:
 
 
 async def on_startup(app: Application) -> None:
+	await init_db()
 	# Auto-subscribe ADMIN_CHAT_ID if provided (>0)
 	if isinstance(ADMIN_CHAT_ID, int) and ADMIN_CHAT_ID > 0:
 		subscribed_chat_ids.add(ADMIN_CHAT_ID)
@@ -711,35 +721,112 @@ async def process_new_tokens_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
 					logger.info("Filtered out due to low score (<%s): %s", MIN_SCORE, mint)
 					continue
 
-				# AI analysis
-				ai_text = await ai_short_analysis(score, metrics)
+				# Build on-chain feature dict for gates/scoring (placeholders for early metrics)
+				onchain = {
+					"market_cap_usd": agg.get("market_cap_usd"),
+					"liquidity_usd": agg.get("liquidity_usd"),
+					"pairs_count": agg.get("pairs_count") or 0,
+					"price_usd": agg.get("price_usd"),
+					# Early micro-signals placeholders (could be filled from Enhanced rolling window later)
+					"buy_ratio_10m": None,
+					"unique_buyers_5m": None,
+					"volume_5m_raw": None,
+					"holder_growth_10m": None,
+					"top5_holders_pct": None,
+					"pool_age_min": None,
+				}
+				safety = {
+					"freeze_authority": None,
+					"mint_authority": None,
+					"lp_lock_pct": None,
+					"lp_lock_time_h": None,
+				}
 
-				# Build and send message
-				price_text = abbreviate_usd(metrics["price_usd"]) if metrics["price_usd"] is not None else "N/A"
-				liq_text = abbreviate_usd(metrics["liquidity_usd"]) if metrics["liquidity_usd"] is not None else "N/A"
-				vol_text = abbreviate_usd(metrics["volume_24h_usd"]) if metrics["volume_24h_usd"] is not None else "N/A"
-				mc_text = abbreviate_usd(metrics["market_cap_usd"]) if metrics["market_cap_usd"] is not None else "N/A"
+				# Gates: name/symbol sanity
+				if contains_bad(symbol or "") or contains_bad(name or ""):
+					logger.info("Filtered suspicious name/symbol: %s %s", name, symbol)
+					continue
+
+				ok1, reason1 = gate1_onchain(onchain)
+				if not ok1:
+					logger.info("Gate1 failed (%s) for %s", reason1, mint)
+					continue
+
+				# Twitter enrichment only after Gate1 (rate-save)
+				tw: Dict[str, Any] = {}
+				try:
+					ctx = await fetch_project_context(mint, symbol, name)
+					acct = (ctx.get("accounts") or [None])[0]
+					stats = await fetch_account_stats(acct) if acct else {}
+					mentions = await search_mentions(mint, since_minutes=60)
+					tw = {
+						"account": acct,
+						"followers": stats.get("followers"),
+						"er": stats.get("er"),
+						"mentions_count": mentions.get("count"),
+						"mentions_unique_authors": mentions.get("unique_authors"),
+						"influencers": mentions.get("influencers"),
+						"sentiment": mentions.get("sentiment"),
+					}
+				except Exception:
+					logger.exception("Twitter enrichment failed for %s", mint)
+					pass
+
+				# Multifactor scoring
+				score, details = score_multifactor(onchain, tw, safety)
+
+				# Dynamic threshold with recent distribution
+				recent = await get_recent_scores(DYNAMIC_WINDOW_RECENT)
+				thr = int(MIN_SCORE)
+				if recent:
+					p75 = sorted(recent)[int(0.75 * len(recent))]
+					thr = max(thr, p75)
+
+				if score < thr:
+					logger.info("Below threshold %s: %s score=%s", thr, mint, score)
+					# persist history
+					await save_score_history(mint, int(time.time()), score, details)
+					await save_token_row(mint, int(time.time()), name, symbol, score, 0, MODE, thr)
+					await save_features(mint, onchain, tw, safety, {"mode": MODE})
+					continue
+
+				# AI analysis
+				ai_text = await ai_short_analysis(score, {
+					"onchain": onchain,
+					"twitter": tw,
+					"safety": safety,
+				})
+
+				# Build and send message (enhanced)
+				price_text = abbreviate_usd(metrics["price_usd"]) if (metrics := {"price_usd": metrics.get("price_usd") if 'metrics' in locals() else onchain.get("price_usd")}) else abbreviate_usd(onchain.get("price_usd"))
+				liq_text = abbreviate_usd(onchain.get("liquidity_usd"))
+				vol_text = abbreviate_usd(onchain.get("volume_24h_usd"))
+				mc_text = abbreviate_usd(onchain.get("market_cap_usd"))
 
 				lines: List[str] = []
-				lines.append(f"🔥 New Token Alert (Score: {score}/100)")
-				lines.append(f"{name or 'Unknown'} ({symbol or '?'})")
-				lines.append(f"Цена: {price_text}")
-				lines.append(f"Маркеткап: {mc_text}")
-				lines.append(f"Ликвидность: {liq_text}")
-				lines.append(f"Объём 24ч: {vol_text}")
-				lines.append(f"AI Analysis: {ai_text}")
-				lines.append(f"[Dexscreener]({metrics['dexs_url']})")
-				lines.append(f"[Geckoterminal]({metrics['gecko_url']})")
-				lines.append(f"Contract: `{mint}`")
+				lines.append(f"🚀 Early Gem Alert (Score: {score}/100)")
+				lines.append(f"{(name or 'Unknown')} ({(symbol or '?')})")
+				lines.append(f"💵 Цена: {price_text} | 💧Ликвидность: {liq_text} | 📈 Объём 24ч: {vol_text} | 🧢 MC: {mc_text}")
+				if tw.get("account"):
+					lines.append(f"🐦 Twitter: @{tw['account']} | 👥 Subs: {tw.get('followers') or '—'} | ER: {tw.get('er') or '—'}")
+				if tw.get("mentions_count"):
+					lines.append(f"🔍 Mentions(60m): {tw['mentions_count']} | Influencers: {len(tw.get('influencers') or [])}")
+				lines.append(f"🤖 AI: {ai_text}")
+				lines.append(f"🔗 [Dexscreener](https://dexscreener.com/solana/{mint}) | [GeckoTerminal](https://www.geckoterminal.com/solana/tokens/{mint}) | [Solscan](https://solscan.io/token/{mint})")
+				lines.append(f"📜 Contract: `{mint}`")
 				msg = "\n".join(lines)
 
-				# Send to subscribers
 				for chat_id in list(subscribed_chat_ids):
 					try:
 						await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=False)
-						logger.info("Message sent to %s for %s", chat_id, mint)
+						logger.info("Sent to chat %s mint=%s", chat_id, mint)
 					except Exception:
-						logger.exception("Failed sending message to %s", chat_id)
+						logger.exception("Failed sending to %s", chat_id)
+
+				# persist
+				await save_score_history(mint, int(time.time()), score, details)
+				await save_token_row(mint, int(time.time()), name, symbol, score, 1, MODE, thr)
+				await save_features(mint, onchain, tw, safety, {"mode": MODE})
 
 				# Mark as seen to avoid duplicates
 				seen_token_addresses.add(mint)
