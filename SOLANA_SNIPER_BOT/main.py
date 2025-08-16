@@ -55,6 +55,12 @@ GECKO_TOKEN_URL_TPL: str = f"{GECKO_BASE_URL}/networks/solana/tokens/{{mint}}"
 # Dexscreener token endpoint
 DEXSCREENER_TOKEN_URL_TPL: str = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 
+# Helius (WS + Enhanced Transactions)
+PUMPFUN_PROGRAM: str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+HELIUS_WS_URL: str = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+HELIUS_ENHANCED_TX_URL: str = f"https://api.helius.xyz/v0/transactions?api-key={HELIUS_API_KEY}"
+HELIUS_RPC_HTTP_URL: str = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
 # Bitquery streaming
 BITQUERY_WS_URL: str = "wss://streaming.bitquery.io/graphql"
 # Pump.fun create instruction subscription (new token signal)
@@ -108,7 +114,10 @@ seen_token_addresses: Set[str] = set()
 
 # New runtime queues/sets
 new_token_events_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+enhance_sig_queue: "asyncio.Queue[Tuple[str, float]]" = asyncio.Queue()
 ws_reconnect_backoff_seconds: float = 3.0
+sig_retry_count: Dict[str, int] = {}
+DEBUG_WS_RAW: bool = False
 
 
 # ----------------------------------------------------------------------------
@@ -130,6 +139,10 @@ def abbreviate_usd(value: Optional[float]) -> str:
 	if abs_num >= 1_000:
 		return f"${num/1_000:.2f}K"
 	return f"${num:.2f}"
+
+
+def is_probable_sig(s: Any) -> bool:
+	return isinstance(s, str) and 60 <= len(s) <= 120
 
 
 def safe_get_nested(mapping: Dict[str, Any], *keys: str) -> Optional[Any]:
@@ -561,9 +574,13 @@ async def prefill_seen_tokens() -> None:
 
 async def on_startup(app: Application) -> None:
 	await init_db()
-	# Auto-subscribe ADMIN_CHAT_ID if provided (>0)
-	if isinstance(ADMIN_CHAT_ID, int) and ADMIN_CHAT_ID > 0:
-		subscribed_chat_ids.add(ADMIN_CHAT_ID)
+	# Auto-subscribe ADMIN_CHAT_ID if provided (>0); accept str or int
+	try:
+		admin_id_int = int(ADMIN_CHAT_ID)
+		if admin_id_int > 0:
+			subscribed_chat_ids.add(admin_id_int)
+	except Exception:
+		pass
 	await prefill_seen_tokens()
 	logger.info("Subscribed chat IDs at startup: %s", subscribed_chat_ids)
 	# Launch background consumers (Bitquery optional). If no token, skip.
@@ -575,6 +592,10 @@ async def on_startup(app: Application) -> None:
 			self.bot = bot
 	context_proxy = _Ctx(app.bot)
 	asyncio.create_task(process_new_tokens_worker(context_proxy))
+	# Launch Helius WS consumer
+	asyncio.create_task(helius_ws_consumer())
+	# Launch Helius Enhanced worker
+	asyncio.create_task(helius_enhanced_worker())
 
 
 async def bitquery_ws_consumer() -> None:
@@ -879,6 +900,187 @@ async def process_new_tokens_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
 				seen_token_addresses.add(mint)
 			except Exception:
 				logger.exception("Failed to process event for %s", mint)
+
+
+async def helius_ws_consumer() -> None:
+	global ws_reconnect_backoff_seconds
+	# Subscribe to Pump.fun program logs
+	sub_msg = {
+		"jsonrpc": "2.0",
+		"id": 1,
+		"method": "logsSubscribe",
+		"params": [
+			{"mentions": [PUMPFUN_PROGRAM]},
+			{"commitment": "confirmed"},
+		],
+	}
+	while True:
+		try:
+			logger.info("Connecting to Helius WS...")
+			async with websockets.connect(HELIUS_WS_URL, ping_interval=20, ping_timeout=20) as ws:
+				await ws.send(json.dumps(sub_msg))
+				try:
+					ack = await asyncio.wait_for(ws.recv(), timeout=10)
+					if DEBUG_WS_RAW:
+						logger.info("Helius WS ACK: %s", ack[:500])
+				except Exception:
+					logger.warning("No ACK received from Helius WS")
+				async for raw in ws:
+					try:
+						if DEBUG_WS_RAW:
+							logger.info("WS RAW: %s", raw[:500])
+						msg = json.loads(raw)
+						if msg.get("method") != "logsNotification":
+							continue
+						value = (((msg.get("params") or {}).get("result") or {}).get("value") or {})
+						signature = value.get("signature")
+						if not is_probable_sig(signature):
+							continue
+						await enhance_sig_queue.put((signature, time.monotonic()))
+					except Exception:
+						logger.exception("Helius WS parse error")
+			ws_reconnect_backoff_seconds = 3.0
+		except Exception:
+			logger.exception("Helius WS disconnected; retry in %.1fs", ws_reconnect_backoff_seconds)
+			await asyncio.sleep(ws_reconnect_backoff_seconds)
+			ws_reconnect_backoff_seconds = min(ws_reconnect_backoff_seconds * 2, 60.0)
+
+
+async def rpc_get_transaction_mints(session: aiohttp.ClientSession, signature: str) -> List[str]:
+	try:
+		payload = {
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "getTransaction",
+			"params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+		}
+		resp = await session.post(
+			HELIUS_RPC_HTTP_URL,
+			json=payload,
+			headers={"Content-Type": "application/json"},
+			timeout=aiohttp.ClientTimeout(total=15),
+		)
+		if resp.status != 200:
+			return []
+		js = await resp.json()
+		res = js.get("result") or {}
+		meta = res.get("meta") or {}
+		mints: Set[str] = set()
+		for bal in (meta.get("postTokenBalances") or []):
+			m = bal.get("mint")
+			if m:
+				mints.add(m)
+		for bal in (meta.get("preTokenBalances") or []):
+			m = bal.get("mint")
+			if m:
+				mints.add(m)
+		return list(mints)
+	except Exception:
+		return []
+
+
+ENHANCED_MIN_AGE_S = 6.0
+ENHANCED_BATCH_MAX = 12
+ENHANCED_FLUSH_EVERY_S = 2.5
+ENHANCED_MAX_RETRY = 1
+FALLBACK_RPC_PER_BATCH = 1
+
+async def helius_enhanced_worker() -> None:
+	async with aiohttp.ClientSession() as session:
+		pending: List[Tuple[str, float]] = []
+		recent_sig_seen: Set[str] = set()
+		last_cleanup = time.monotonic()
+		while True:
+			# drain queue
+			try:
+				while True:
+					item = enhance_sig_queue.get_nowait()
+					pending.append(item)
+			except asyncio.QueueEmpty:
+				pass
+			now = time.monotonic()
+			if now - last_cleanup > 60:
+				recent_sig_seen.clear()
+				last_cleanup = now
+			# build batch
+			batch: List[str] = []
+			remain: List[Tuple[str, float]] = []
+			for sig, t in pending:
+				if len(batch) >= ENHANCED_BATCH_MAX:
+					remain.append((sig, t))
+					continue
+				if (now - t) < ENHANCED_MIN_AGE_S:
+					remain.append((sig, t))
+					continue
+				if sig in recent_sig_seen or not is_probable_sig(sig):
+					continue
+				batch.append(sig)
+			pending = remain
+			if not batch:
+				await asyncio.sleep(ENHANCED_FLUSH_EVERY_S)
+				continue
+			headers = {"Content-Type": "application/json"}
+			payload = {"transactions": batch, "commitment": "confirmed"}
+			try:
+				resp = await session.post(
+					HELIUS_ENHANCED_TX_URL,
+					json=payload,
+					headers=headers,
+					timeout=aiohttp.ClientTimeout(total=20),
+				)
+				if resp.status == 429:
+					logger.warning("Helius enhanced 429, batch=%d; backing off", len(batch))
+					now2 = time.monotonic()
+					pending.extend([(s, now2 + 1.2) for s in batch])
+					await asyncio.sleep(1.0 + random.random() * 1.0)
+					continue
+				if resp.status != 200:
+					text = await resp.text()
+					logger.warning("Helius enhanced batch -> %s; %s", resp.status, text[:240])
+					retryable: List[str] = []
+					for s in batch:
+						c = sig_retry_count.get(s, 0)
+						if c < ENHANCED_MAX_RETRY:
+							sig_retry_count[s] = c + 1
+							retryable.append(s)
+					fallback_count = 0
+					for s in batch:
+						if fallback_count >= FALLBACK_RPC_PER_BATCH:
+							break
+						mints = await rpc_get_transaction_mints(session, s)
+						if mints:
+							for m in mints:
+								if m not in seen_token_addresses:
+									await new_token_events_queue.put({"mint": m, "symbol": None, "name": None})
+							fallback_count += 1
+					now2 = time.monotonic()
+					pending.extend([(s, now2 + 1.5) for s in retryable])
+					await asyncio.sleep(0.5)
+					continue
+				txs = await resp.json()
+				if not isinstance(txs, list):
+					await asyncio.sleep(0.2)
+					continue
+				mints_pushed = 0
+				for tx in txs:
+					for tt in (tx.get("tokenTransfers") or []):
+						m = tt.get("mint")
+						if not m:
+							continue
+						if m in seen_token_addresses:
+							continue
+						await new_token_events_queue.put({"mint": m, "symbol": None, "name": None})
+						mints_pushed += 1
+				if mints_pushed:
+					logger.info("Enhanced batch ok: %d sigs, %d mints enqueued", len(batch), mints_pushed)
+				for s in batch:
+					recent_sig_seen.add(s)
+					sig_retry_count.pop(s, None)
+			except Exception:
+				logger.exception("Helius enhanced worker failure")
+				now2 = time.monotonic()
+				pending.extend([(s, now2 + 1.5) for s in batch])
+			await asyncio.sleep(0.15 + random.random() * 0.15)
 
 
 def main() -> None:
